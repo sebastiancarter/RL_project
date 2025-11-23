@@ -89,7 +89,7 @@ class SimpleGreedyLearner(RLAgent):
 
 
     def episodeStart(self):
-        pass # is this right?
+        pass # is this right? yes
 
     # No need to change this one
     def maxSupportedActions(self):
@@ -99,23 +99,68 @@ class SimpleGreedyLearner(RLAgent):
 # Implement the version with alpha_i=1 (uniform)
 class PSRL(RLAgent):
     def __init__(self):
-        #YOUR CODE HERE
-        pass #remove once implemented
+        # Prior parameter alpha_i = 1 (uniform) for each outcome
+        self.alpha_i = 1
+        self.counts = None  # (s,a,o) -> count
+        self.policy = None
         
     def initWithEnvironment(self,env):
-        #YOUR CODE HERE
-        pass #remove and return True once implemented
+        self.env = env
+        self.counts = {}
+        # Initialize Dirichlet counts with prior alpha_i for every valid (s,a,o)
+        for state in self.env.getAllStates():
+            for action in range(self.env.getNumActions()):
+                if not self.env.isActionValid(state, action):
+                    continue
+                for outcome in range(self.env.getNumOutcomes()):
+                    self.counts[(state, action, outcome)] = self.alpha_i
+        self.policy = None
+        return True
         
     def chooseAction(self, state, t):
-        #YOUR CODE HERE
-        pass #remove once implemented
+        if self.policy is None:
+            # no policy yet, choose random valid action
+            validActions = []
+            for action in range(self.env.getNumActions()):
+                if self.env.isActionValid(state, action):
+                    validActions.append(action)
+            return random.choice(validActions)
+        else:
+            return self.policy[(state, t)]
         
     def processEpisode(self, episode):
-        #YOUR CODE HERE
-        pass #remove once implemented
+        # Update posterior counts with observed outcomes
+        for (state, action, outcome) in episode:
+            # Skip invalid (shouldn't happen if episode well-formed)
+            if not self.env.isActionValid(state, action):
+                continue
+            self.counts[(state, action, outcome)] += 1
+        
             
     def episodeStart(self):
-        pass # is this right?
+        # Sample a model from the current Dirichlet posteriors
+        obsProbs = {}
+        for state in self.env.getAllStates():
+            for action in range(self.env.getNumActions()):
+                if not self.env.isActionValid(state, action):
+                    continue
+                # Gather counts for (s,a,·)
+                outcomeCounts = [self.counts[(state, action, o)] for o in range(self.env.getNumOutcomes())]
+                # Sample Dirichlet by sampling gammas and normalizing
+                gammaSamples = []
+                for c in outcomeCounts:
+                    # shape=c, scale=1 gives Gamma(c,1)
+                    gammaSamples.append(random.gammavariate(c, 1.0))
+                total = sum(gammaSamples)
+                # Avoid division by zero (shouldn't occur because c>=1) but safeguard
+                if total == 0:
+                    probs = [1.0 / self.env.getNumOutcomes()] * self.env.getNumOutcomes()
+                else:
+                    probs = [g / total for g in gammaSamples]
+                obsProbs[(state, action)] = probs
+        # Build MDP with sampled transition outcome probabilities and compute optimal policy
+        sampledMDP = mdp.MDP(self.env, obsProbs)
+        self.policy = sampledMDP.computeOptimalPolicy()
 
     # No need to change this one
     def maxSupportedActions(self):
