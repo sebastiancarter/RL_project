@@ -101,23 +101,26 @@ class PSRL(RLAgent):
     def __init__(self):
         # Prior parameter alpha_i = 1 (uniform) for each outcome
         self.alpha_i = 1
-        self.counts = None  # (s,a,o) -> count
+        self.alphas = None  # (s,a,o) -> count
         self.policy = None
         
     def initWithEnvironment(self,env):
         self.env = env
-        self.counts = {}
+        self.alphas = {}
         # Initialize Dirichlet counts with prior alpha_i for every valid (s,a,o)
         for state in self.env.getAllStates():
             for action in range(self.env.getNumActions()):
                 if not self.env.isActionValid(state, action):
                     continue
+
+                self.alphas[(state, action)] = []
                 for outcome in range(self.env.getNumOutcomes()):
-                    self.counts[(state, action, outcome)] = self.alpha_i
+                    self.alphas[(state, action)].append(self.alpha_i)
         self.policy = None
         return True
         
     def chooseAction(self, state, t):
+        # TODO: remove this is none thing, redundant and will lose points
         if self.policy is None:
             # no policy yet, choose random valid action
             validActions = []
@@ -134,43 +137,22 @@ class PSRL(RLAgent):
             # Skip invalid (shouldn't happen if episode well-formed)
             if not self.env.isActionValid(state, action):
                 continue
-            self.counts[(state, action, outcome)] += 1
+            self.alphas[(state, action)][outcome] += 1
         
             
     def episodeStart(self):
-        # Sample a model from the current Dirichlet posteriors
-        obsProbs = {}
+        outcomeProbs = {}
         for state in self.env.getAllStates():
             for action in range(self.env.getNumActions()):
                 if not self.env.isActionValid(state, action):
                     continue
-                # Gather counts for (s,a,·)
-                outcomeCounts = [self.counts[(state, action, o)] for o in range(self.env.getNumOutcomes())]
-                # Sample Dirichlet by sampling gammas and normalizing
-                gammaSamples = []
-                for c in outcomeCounts:
-                    # shape=c, scale=1 gives Gamma(c,1)
-                    gammaSamples.append(random.gammavariate(c, 1.0))
-                total = sum(gammaSamples)
-                # Avoid division by zero (shouldn't occur because c>=1) but safeguard
-                if total == 0:
-                    probs = [1.0 / self.env.getNumOutcomes()] * self.env.getNumOutcomes()
-                else:
-                    probs = [g / total for g in gammaSamples]
-                obsProbs[(state, action)] = probs
-        # Build MDP with sampled transition outcome probabilities and compute optimal policy
-        sampledMDP = mdp.MDP(self.env, obsProbs)
-        self.policy = sampledMDP.computeOptimalPolicy()
+                dirichletPrior = dists.DirichletDistribution(self.alphas[(state, action)])
+                outcomeProbs[(state,action)] = dirichletPrior.sample()
+        self.policy = mdp.MDP(self.env, outcomeProbs).computeOptimalPolicy()
 
     # No need to change this one
     def maxSupportedActions(self):
         return None
-		
-
-
-
-
-
 
 
 
@@ -178,28 +160,94 @@ class PSRL(RLAgent):
 #implements the simplified PPO algorithm as discussed in class
 class PPOLearner(RLAgent):
     def __init__(self, priorParam, numBetweenUpdates, epsilon):
-        # YOUR CODE HERE
-        pass  # remove once implemented
+        self.thetaCurr = priorParam
+        self.numEpsBetweenUpdates = numBetweenUpdates
+        self.epsilon = epsilon
+        self.policy = None
+        self.episodesBetweenUpdatesList = []
+        self.criticDict = {}
+        self.estQvalsDict = {}
 
-        
     def initWithEnvironment(self, env):
-        # YOUR CODE HERE
-        pass  # remove and return True once implemented
+        self.env = env
+        return True
 
     def chooseAction(self, state, t):
-        # YOUR CODE HERE
-        pass  # remove once implemented
+        # TODO: add a comment explaining why
+        if self.thetaCurr > random.random():
+            return 1 # choose action 1
+        else:
+            return 0 # choose action 0
 
     def processEpisode(self, episode):
-        # YOUR CODE HERE
-        pass  # remove once implemented
+        self.episodesBetweenUpdatesList.append(episode)
+        rewardToGo = 0
+        for timestep in range(len(episode)-1, -1, -1):
+            (state, action, outcome) = episode[timestep]
+            reward = self.env.getReward(state, action, outcome)
+            rewardToGo += reward
 
+            # doing this the long way because I dont like .get            
+            if (state, action, timestep) not in self.estQvalsDict:
+                self.estQvalsDict[(state, action, timestep)] = (0,0) # (count, summedRewards)
+            if (state, timestep) not in self.criticDict:
+                self.criticDict[(state, timestep)] = (0,0) # (count, summedRewards)
+             
+            (count, summedrewards) = self.estQvalsDict[(state, action, timestep)]
+            count += 1
+            summedrewards += rewardToGo
+            self.estQvalsDict[(state, action, timestep)] = (count, summedrewards)
+
+            (count, summedrewards) = self.criticDict[(state, timestep)]
+            count += 1
+            summedrewards += rewardToGo
+            self.criticDict[(state, timestep)] = (count, summedrewards) 
+    
+
+    def objectiveFunc(self, optimizeQuantity, additionalArgs):
+        thingSum = 0 # TODO: choose better name and check if dividing optimizeQuantity by thetaCurr is correct
+        (oldTheta, epsilon, critic, estQvals, clipFunc) = additionalArgs
+        for episode in self.episodesBetweenUpdatesList:
+            for timestep in range(len(episode)):
+                (state, action, outcome) = episode[timestep]
+                (criticCount, criticSum) = critic[(state, timestep)]
+                (estQCount, estQSum) = estQvals[(state, action, timestep)]
+                currAdvantage = estQSum/estQCount - criticSum/criticCount
+                thingSum += min(currAdvantage * (optimizeQuantity / oldTheta),
+                                currAdvantage * clipFunc(optimizeQuantity / oldTheta, 
+                                                           1 - epsilon, 
+                                                           1 + epsilon
+                                                        )
+                            )
+        return thingSum                
+    
     def updatePolicy(self):
-        # YOUR CODE HERE
-        pass  # remove once implemented
+        newTheta = scipy.optimize.minimize(self.objectiveFunc, x0=self.thetaCurr, args=((self.thetaCurr, self.epsilon, self.criticDict, self.estQvalsDict, self.clipFunc),), bounds=[(0,1)])
+        argminTheta = newTheta.x[0]
+        self.thetaCurr = argminTheta
+    
+    def clipFunc(self, value, lower, upper):
+        if value < lower:
+            return lower
+        elif value > upper:
+            return upper
+        else:
+            return value
+
+    def resetCriticAndEstQvals(self):
+        self.criticDict = {}
+        self.estQvalsDict = {}
+        for action in range(self.env.getNumActions()):
+            for state in self.env.getAllStates():
+                for timestep in range(self.env.getTimeHorizon()):
+                    self.criticDict[(state, timestep)] = (0,0) # (count, summedRewards)
+                    self.estQvalsDict[(state, action, timestep)] = (0,0) # (count, summedRewards)
 
     def episodeStart(self):
-        pass # is this right?
+        if len(self.episodesBetweenUpdatesList) - 1 == self.numEpsBetweenUpdates:
+            self.updatePolicy()
+            self.episodesBetweenUpdatesList = []
+            self.resetCriticAndEstQvals()
 
     # No need to change this one
     def maxSupportedActions(self):
