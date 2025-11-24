@@ -120,16 +120,7 @@ class PSRL(RLAgent):
         return True
         
     def chooseAction(self, state, t):
-        # TODO: remove this is none thing, redundant and will lose points
-        if self.policy is None:
-            # no policy yet, choose random valid action
-            validActions = []
-            for action in range(self.env.getNumActions()):
-                if self.env.isActionValid(state, action):
-                    validActions.append(action)
-            return random.choice(validActions)
-        else:
-            return self.policy[(state, t)]
+        return self.policy[(state, t)]
         
     def processEpisode(self, episode):
         # Update posterior counts with observed outcomes
@@ -163,17 +154,23 @@ class PPOLearner(RLAgent):
         self.thetaCurr = priorParam
         self.numEpsBetweenUpdates = numBetweenUpdates
         self.epsilon = epsilon
-        self.policy = None
         self.episodesBetweenUpdatesList = []
+        self.nextCriticDict = {}
         self.criticDict = {}
-        self.estQvalsDict = {}
+        self.rewardsToGoPerEpisodeList = []
 
     def initWithEnvironment(self, env):
         self.env = env
+        for state in self.env.getAllStates():
+            for timestep in range(self.env.getTimeHorizon()):
+                self.criticDict[(state, timestep)] = (0,0) # (count, summedRewards)
+                self.nextCriticDict[(state, timestep)] = (0,0) # (count, summedRewards)
         return True
 
     def chooseAction(self, state, t):
-        # TODO: add a comment explaining why
+        # choose action based on current policy parameter thetaCurr
+        # this is essentially a Bernoulli with parameter thetaCurr
+        # and is equivalent to flipping a coin with probability thetaCurr
         if self.thetaCurr > random.random():
             return 1 # choose action 1
         else:
@@ -182,48 +179,72 @@ class PPOLearner(RLAgent):
     def processEpisode(self, episode):
         self.episodesBetweenUpdatesList.append(episode)
         rewardToGo = 0
+        episodeRewardToGoList = []
         for timestep in range(len(episode)-1, -1, -1):
             (state, action, outcome) = episode[timestep]
             reward = self.env.getReward(state, action, outcome)
             rewardToGo += reward
+            episodeRewardToGoList.append(rewardToGo)
 
             # doing this the long way because I dont like .get            
-            if (state, action, timestep) not in self.estQvalsDict:
-                self.estQvalsDict[(state, action, timestep)] = (0,0) # (count, summedRewards)
-            if (state, timestep) not in self.criticDict:
-                self.criticDict[(state, timestep)] = (0,0) # (count, summedRewards)
-             
-            (count, summedrewards) = self.estQvalsDict[(state, action, timestep)]
-            count += 1
-            summedrewards += rewardToGo
-            self.estQvalsDict[(state, action, timestep)] = (count, summedrewards)
+            if (state, timestep) not in self.nextCriticDict:
+                self.nextCriticDict[(state, timestep)] = (0,0) # (count, summedRewards)
 
-            (count, summedrewards) = self.criticDict[(state, timestep)]
+
+            (count, summedrewards) = self.nextCriticDict[(state, timestep)]
             count += 1
             summedrewards += rewardToGo
-            self.criticDict[(state, timestep)] = (count, summedrewards) 
-    
+            self.nextCriticDict[(state, timestep)] = (count, summedrewards) 
+        # reverse the list to get correct order
+        episodeRewardToGoList.reverse() # .reverse() reverses the list in place
+        self.rewardsToGoPerEpisodeList.append(episodeRewardToGoList)
+        if len(self.episodesBetweenUpdatesList) >= self.numEpsBetweenUpdates:
+            self.updatePolicy()
+            self.episodesBetweenUpdatesList = []
+            self.resetCriticAndRewardsToGo()
+
 
     def objectiveFunc(self, optimizeQuantity, additionalArgs):
-        thingSum = 0 # TODO: choose better name and check if dividing optimizeQuantity by thetaCurr is correct
-        (oldTheta, epsilon, critic, estQvals, clipFunc) = additionalArgs
-        for episode in self.episodesBetweenUpdatesList:
+        optimizeQuantity = optimizeQuantity[0]
+        scaledAdvantageSum = 0 
+        (oldTheta, epsilon, critic, rewardsToGoPerEpisodeList, episodesBetweenUpdatesList, clipFunc) = additionalArgs
+        for episodeNum in range(len(episodesBetweenUpdatesList)):
+            episode = episodesBetweenUpdatesList[episodeNum]
+            currRewardToGoList = rewardsToGoPerEpisodeList[episodeNum]
             for timestep in range(len(episode)):
                 (state, action, outcome) = episode[timestep]
                 (criticCount, criticSum) = critic[(state, timestep)]
-                (estQCount, estQSum) = estQvals[(state, action, timestep)]
-                currAdvantage = estQSum/estQCount - criticSum/criticCount
-                thingSum += min(currAdvantage * (optimizeQuantity / oldTheta),
-                                currAdvantage * clipFunc(optimizeQuantity / oldTheta, 
+                rewardToGo = currRewardToGoList[timestep]
+                if criticCount == 0:
+                    currAdvantage = rewardToGo # if no critic info, critic guesses 0
+                    # this way we avoid division by zero
+                else:
+                    currAdvantage = rewardToGo - criticSum/criticCount
+
+                if action == 1:
+                    pi_old = oldTheta
+                    pi_new = optimizeQuantity
+                else:
+                    pi_old = 1 - oldTheta
+                    pi_new = 1 - optimizeQuantity
+        
+                scaledAdvantageSum += min(currAdvantage * (pi_new / pi_old),
+                                currAdvantage * clipFunc(pi_new / pi_old, 
                                                            1 - epsilon, 
                                                            1 + epsilon
                                                         )
                             )
-        return thingSum                
+        return -scaledAdvantageSum                
     
     def updatePolicy(self):
-        newTheta = scipy.optimize.minimize(self.objectiveFunc, x0=self.thetaCurr, args=((self.thetaCurr, self.epsilon, self.criticDict, self.estQvalsDict, self.clipFunc),), bounds=[(0,1)])
+        newTheta = scipy.optimize.minimize(self.objectiveFunc, x0=self.thetaCurr, args=((self.thetaCurr, 
+                                                                                         self.epsilon, 
+                                                                                         self.criticDict.copy(), 
+                                                                                         self.rewardsToGoPerEpisodeList.copy(), 
+                                                                                         self.episodesBetweenUpdatesList.copy(),
+                                                                                         self.clipFunc),), bounds=[(0,1)])
         argminTheta = newTheta.x[0]
+        print("Updated theta from " + str(self.thetaCurr) + " to " + str(argminTheta))
         self.thetaCurr = argminTheta
     
     def clipFunc(self, value, lower, upper):
@@ -234,21 +255,16 @@ class PPOLearner(RLAgent):
         else:
             return value
 
-    def resetCriticAndEstQvals(self):
-        self.criticDict = {}
-        self.estQvalsDict = {}
-        for action in range(self.env.getNumActions()):
-            for state in self.env.getAllStates():
-                for timestep in range(self.env.getTimeHorizon()):
-                    self.criticDict[(state, timestep)] = (0,0) # (count, summedRewards)
-                    self.estQvalsDict[(state, action, timestep)] = (0,0) # (count, summedRewards)
+    def resetCriticAndRewardsToGo(self):
+        self.criticDict = self.nextCriticDict.copy()
+        self.nextCriticDict = {}
+        for state in self.env.getAllStates():
+            for timestep in range(self.env.getTimeHorizon()):
+                self.nextCriticDict[(state, timestep)] = (0,0) # (count, summedRewards)
+        self.rewardsToGoPerEpisodeList = []
 
     def episodeStart(self):
-        if len(self.episodesBetweenUpdatesList) - 1 == self.numEpsBetweenUpdates:
-            self.updatePolicy()
-            self.episodesBetweenUpdatesList = []
-            self.resetCriticAndEstQvals()
-
+        pass
     # No need to change this one
     def maxSupportedActions(self):
         return 2  # Your implementation will only support two actions
@@ -256,23 +272,67 @@ class PPOLearner(RLAgent):
 # Implements the finite horizon Q-Learning algorithm as discussed in class
 class QLearner(RLAgent):
     def __init__(self, epsilon, alpha):
-        #YOUR CODE HERE
-        pass #remove once implemented
-        
+        self.alpha = alpha
+        self.epsilon = epsilon
+
     def initWithEnvironment(self,env):
-        #YOUR CODE HERE
-        pass #remove and return True once implemented
-        
+        self.env = env
+        self.Q = {} # (state, action, t) -> Q-value
+        for state in self.env.getAllStates():
+            for action in range(self.env.getNumActions()):
+                for timestep in range(self.env.getTimeHorizon()):
+                    if not self.env.isActionValid(state, action):
+                        continue
+                    self.Q[(state, action, timestep)] = 0.0
+        return True
+     
     def chooseAction(self, state, t):
-        #YOUR CODE HERE
-        pass #remove once implemented
+        if random.random() < self.epsilon:
+            # explore, choose random valid action
+            validActions = []
+            for action in range(self.env.getNumActions()):
+                if self.env.isActionValid(state, action):
+                    validActions.append(action)
+            return random.choice(validActions)
+        else:
+            # exploit, choose best known action
+            bestAction = None
+            bestQValue = None
+            for action in range(self.env.getNumActions()):
+                if not self.env.isActionValid(state, action):
+                    continue
+                qValue = self.Q[(state, action, t)]
+                if bestQValue is None or qValue > bestQValue:
+                    bestQValue = qValue
+                    bestAction = action
+            return bestAction
         
     def processEpisode(self, episode):
-        #YOUR CODE HERE
-        pass #remove once implemented
+        for timestep in range(len(episode)):
+            (state, action, outcome) = episode[timestep]
+            reward = self.env.getReward(state, action, outcome)
+            nextState = self.env.getNextState(state, action, outcome)
+            currentQ = self.Q[(state, action, timestep)]
+            futureValue = 0.0
+            if nextState is not None and timestep < self.env.getTimeHorizon() - 1:
+                # find max_a' Q(nextState, a', timestep+1)
+                bestNextQ = None
+                for nextAction in range(self.env.getNumActions()):
+                    if not self.env.isActionValid(nextState, nextAction):
+                        continue
+                    nextQ = self.Q[(nextState, nextAction, timestep + 1)]
+                    if bestNextQ is None or nextQ > bestNextQ:
+                        bestNextQ = nextQ
+                futureValue = bestNextQ
+            # Q-learning update
+            newQ = currentQ + self.alpha * (reward + futureValue - currentQ)
+            # 
+            for timeStep in range(self.env.getTimeHorizon()):
+                self.Q[(state, action, timeStep)] = newQ
+        
             
     def episodeStart(self):
-        pass # is this right?
+        pass
 
     def maxSupportedActions(self):
         return None

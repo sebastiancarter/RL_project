@@ -59,6 +59,14 @@ class MDP:
                     if bestValue is None or actionValue > bestValue:
                         bestValue = actionValue
                         bestAction = action
+                    elif actionValue == bestValue:
+                        # pick action w/ lowest numeric val if tied
+                        # I believe this is maybe redundant because we loop through actions
+                        # in order, but just to be safe:
+                        if action < bestAction:
+                            bestValue = actionValue
+                            bestAction = action
+                            
                 # Record optimal action and value for (state, t)
                 policy[(state, t)] = bestAction
                 if bestValue is None:
@@ -84,5 +92,3 @@ class MDP:
         print("Error! Should have sampled a value by now!")
         sys.exit(-1)
             
-                    
-                
